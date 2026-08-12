@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airline Booking</title>
+<!--
+  A deliberately small single-page client, served as static files by the same
+  nginx that fronts the API. It exists so the backend can be demonstrated to
+  someone who does not want to read curl output.
+
+  No framework and no build step: one HTML file, plain fetch(). The backend is
+  the project; this is a window onto it, and a React app here would add a
+  toolchain without demonstrating anything the API does not already do.
+
+  It talks to the API on the same origin, so there is no CORS configuration and
+  no hardcoded host — it works wherever the gateway is served from.
+-->
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --ink: #14161a; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #1d4ed8; --ok: #15803d; --bad: #b91c1c;
+    --taken: #e5e7eb; --sel: #1d4ed8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px 64px;
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--ink);
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  header { margin-bottom: 20px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px; margin-bottom: 16px;
+  }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  input, select {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line);
+    border-radius: 6px; font: inherit; background: #fff; color: inherit;
+  }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 130px; }
+  button {
+    padding: 9px 16px; border: 0; border-radius: 6px; background: var(--accent);
+    color: #fff; font: inherit; font-weight: 500; cursor: pointer;
+  }
+  button:disabled { background: #9ca3af; cursor: not-allowed; }
+  button.ghost { background: #fff; color: var(--ink); border: 1px solid var(--line); }
+  button.danger { background: var(--bad); }
+  .flight {
+    display: flex; align-items: center; gap: 14px; padding: 12px;
+    border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; cursor: pointer;
+  }
+  .flight:hover { border-color: var(--accent); }
+  .flight.on { border-color: var(--accent); background: #eff6ff; }
+  .flight .no { font-weight: 600; min-width: 64px; }
+  .flight .meta { color: var(--muted); font-size: 13px; flex: 1; }
+  .flight .price { font-weight: 600; }
+  .cabin { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; max-width: 420px; }
+  .seat {
+    aspect-ratio: 1; border: 1px solid var(--line); border-radius: 5px; background: #fff;
+    font-size: 11px; display: flex; align-items: center; justify-content: center; cursor: pointer;
+  }
+  .seat.taken { background: var(--taken); color: #9ca3af; cursor: not-allowed; }
+  .seat.on { background: var(--sel); color: #fff; border-color: var(--sel); }
+  .aisle { }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .chip { display: inline-block; width: 11px; height: 11px; border-radius: 3px;
+          border: 1px solid var(--line); vertical-align: -1px; margin-right: 4px; }
+  .msg { padding: 10px 12px; border-radius: 6px; font-size: 14px; margin-bottom: 12px; }
+  .msg.ok { background: #f0fdf4; color: var(--ok); border: 1px solid #bbf7d0; }
+  .msg.bad { background: #fef2f2; color: var(--bad); border: 1px solid #fecaca; }
+  .bk { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .bk:last-child { border-bottom: 0; }
+  .bk .id { font-weight: 600; }
+  .bk .st { font-size: 12px; padding: 2px 8px; border-radius: 20px; background: #f0fdf4; color: var(--ok); }
+  .bk .st.cancelled { background: #f3f4f6; color: var(--muted); }
+  .hidden { display: none; }
+  .who { font-size: 13px; color: var(--muted); }
+  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 28px; }
+  code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Airline Booking</h1>
+    <div class="sub">A thin client over the microservices API — everything goes through the gateway on this origin.</div>
+  </header>
+
+  <div id="msg"></div>
+
+  <!-- AUTH ------------------------------------------------------------- -->
+  <div class="card" id="authCard">
+    <h2>Account</h2>
+    <div class="row">
+      <div><label>Email</label><input id="email" type="email" placeholder="you@example.com"></div>
+      <div><label>Password</label><input id="password" type="password" placeholder="at least 8 characters"></div>
+    </div>
+    <div style="margin-top:12px; display:flex; gap:8px;">
+      <button id="signupBtn">Sign up</button>
+      <button id="loginBtn" class="ghost">Log in</button>
+    </div>
+  </div>
+
+  <div class="card hidden" id="whoCard">
+    <div style="display:flex; align-items:center; justify-content:space-between;">
+      <div class="who">Signed in as <strong id="whoEmail"></strong></div>
+      <button id="logoutBtn" class="ghost">Log out</button>
+    </div>
+  </div>
+
+  <!-- SEARCH ----------------------------------------------------------- -->
+  <div class="card">
+    <h2>Find a flight</h2>
+    <div class="row">
+      <div><label>From</label><select id="origin"></select></div>
+      <div><label>To</label><select id="destination"></select></div>
+      <div><label>Date</label><input id="date" type="date"></div>
+      <div style="display:flex; align-items:flex-end;"><button id="searchBtn">Search</button></div>
+    </div>
+    <div id="results" style="margin-top:14px;"></div>
+  </div>
+
+  <!-- SEAT MAP --------------------------------------------------------- -->
+  <div class="card hidden" id="seatCard">
+    <h2>Choose seats — <span id="seatFlight"></span></h2>
+    <div class="cabin" id="cabin"></div>
+    <div class="legend">
+      <span><i class="chip" style="background:#fff"></i>free</span>
+      <span><i class="chip" style="background:var(--taken)"></i>taken</span>
+      <span><i class="chip" style="background:var(--sel);border-color:var(--sel)"></i>selected</span>
+    </div>
+    <div style="margin-top:14px; display:flex; align-items:center; gap:12px;">
+      <button id="bookBtn" disabled>Book selected</button>
+      <span class="who" id="selInfo"></span>
+    </div>
+  </div>
+
+  <!-- BOOKINGS --------------------------------------------------------- -->
+  <div class="card hidden" id="bookingsCard">
+    <h2>My bookings</h2>
+    <div id="bookings"></div>
+  </div>
+
+  <footer>
+    Backend demo · <code>DECISIONS.md</code> explains why every piece exists
+  </footer>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Same-origin API. nginx serves this page and proxies /auth, /flights and
+// /bookings to the services, so no host is hardcoded anywhere.
+// ---------------------------------------------------------------------------
+const state = { token: null, email: null, flight: null, selected: new Set(), seats: [] };
+
+const $ = (id) => document.getElementById(id);
+const show = (el, on) => el.classList.toggle('hidden', !on);
+
+function say(text, bad = false) {
+  $('msg').innerHTML = `<div class="msg ${bad ? 'bad' : 'ok'}">${text}</div>`;
+  clearTimeout(say._t);
+  say._t = setTimeout(() => ($('msg').innerHTML = ''), 6000);
+}
+
+async function api(path, { method = 'GET', body, auth = false, idempotencyKey } = {}) {
+  const headers = {};
+  if (body) headers['Content-Type'] = 'application/json';
+  if (auth) headers['Authorization'] = `Bearer ${state.token}`;
+  // Every create request carries an Idempotency-Key. Retrying with the same key
+  // returns the FIRST booking rather than making a second one — which is why a
+  // double-click on "Book" cannot double-book.
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+
+  const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  if (!res.ok) throw Object.assign(new Error(data?.error || `HTTP ${res.status}`), { status: res.status, data });
+  return data;
+}
+
+const rupees = (cents) => '₹' + (cents / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 });
+const timeOf = (iso) => iso.slice(11, 16) + 'Z';
+
+// --- auth ------------------------------------------------------------------
+function setSession(token, email) {
+  state.token = token; state.email = email;
+  sessionStorage.setItem('t', token); sessionStorage.setItem('e', email);
+  $('whoEmail').textContent = email;
+  show($('authCard'), false); show($('whoCard'), true); show($('bookingsCard'), true);
+  loadBookings();
+}
+
+async function signup() {
+  try {
+    const email = $('email').value.trim(), password = $('password').value;
+    if (!email || !password) return say('Email and password are required', true);
+    const d = await api('/auth/signup', { method: 'POST', body: { email, password } });
+    setSession(d.token, d.email);
+    say('Account created — you are signed in.');
+  } catch (e) {
+    say(e.status === 409 ? 'That email is already registered — try logging in.' : e.message, true);
+  }
+}
+
+async function login() {
+  try {
+    const email = $('email').value.trim(), password = $('password').value;
+    const d = await api('/auth/login', { method: 'POST', body: { email, password } });
+    setSession(d.token, email);
+    say('Signed in.');
+  } catch (e) {
+    // The API returns the same 401 for a wrong password and an unknown email,
+    // on purpose, so this page cannot be used to discover who has an account.
+    say(e.status === 401 ? 'Invalid credentials.' : e.message, true);
+  }
+}
+
+function logout() {
+  state.token = null; state.email = null;
+  sessionStorage.clear();
+  show($('authCard'), true); show($('whoCard'), false); show($('bookingsCard'), false);
+  say('Signed out.');
+}
+
+// --- search ----------------------------------------------------------------
+async function loadAirports() {
+  const d = await api('/airports');
+  for (const sel of [$('origin'), $('destination')]) {
+    sel.innerHTML = d.airports
+      .map((a) => `<option value="${a.code.trim()}">${a.code.trim()} — ${a.city}</option>`).join('');
+  }
+  $('origin').value = 'BOM';
+  $('destination').value = 'DEL';
+  $('date').value = '2026-09-01';
+}
+
+async function search() {
+  const origin = $('origin').value, destination = $('destination').value, date = $('date').value;
+  if (origin === destination) return say('Origin and destination must differ', true);
+  try {
+    const d = await api(`/flights?origin=${origin}&destination=${destination}&date=${date}`);
+    if (!d.flights.length) {
+      $('results').innerHTML = '<div class="who">No flights on that route and date. Try BOM → DEL on 2026-09-01.</div>';
+      show($('seatCard'), false);
+      return;
+    }
+    $('results').innerHTML = d.flights.map((f) => `
+      <div class="flight" data-id="${f.id}">
+        <span class="no">${f.flight_number}</span>
+        <span class="meta">${timeOf(f.departure_time)} → ${timeOf(f.arrival_time)} · ${f.seats_available} seats left</span>
+        <span class="price">${rupees(f.price_cents)}</span>
+      </div>`).join('');
+    document.querySelectorAll('.flight').forEach((el) =>
+      el.addEventListener('click', () => pickFlight(el.dataset.id, el)));
+  } catch (e) { say(e.message, true); }
+}
+
+// --- seat map --------------------------------------------------------------
+async function pickFlight(id, el) {
+  document.querySelectorAll('.flight').forEach((f) => f.classList.remove('on'));
+  el.classList.add('on');
+  state.flight = id; state.selected.clear();
+  await loadSeats();
+}
+
+async function loadSeats() {
+  try {
+    // Seat-level truth comes from the BOOKING service, not the search read
+    // model — search shows a count that may be a moment stale, this is exact.
+    const d = await api(`/flights/${state.flight}/seats`);
+    state.seats = d.seats;
+    $('seatFlight').textContent = `${d.available} of ${d.total} free`;
+    renderCabin();
+    show($('seatCard'), true);
+  } catch (e) {
+    show($('seatCard'), false);
+    say('No seat map for that flight.', true);
+  }
+}
+
+function renderCabin() {
+  const cols = ['A', 'B', 'C', 'D', 'E', 'F'];
+  const rows = [...new Set(state.seats.map((s) => s.seat_number.replace(/\D/g, '')))]
+    .sort((a, b) => a - b);
+  let html = '';
+  for (const r of rows) {
+    for (const [i, c] of cols.entries()) {
+      const seat = state.seats.find((s) => s.seat_number === `${r}${c}`);
+      if (!seat) { html += '<div></div>'; continue; }
+      const taken = seat.status !== 'available';
+      const on = state.selected.has(seat.seat_number);
+      html += `<div class="seat ${taken ? 'taken' : ''} ${on ? 'on' : ''}" data-s="${seat.seat_number}">${seat.seat_number}</div>`;
+      if (i === 2) html += '<div class="aisle"></div>';
+    }
+  }
+  $('cabin').innerHTML = html;
+  document.querySelectorAll('.seat:not(.taken)').forEach((el) =>
+    el.addEventListener('click', () => toggleSeat(el.dataset.s)));
+  updateSel();
+}
+
+function toggleSeat(n) {
+  state.selected.has(n) ? state.selected.delete(n) : state.selected.add(n);
+  renderCabin();
+}
+
+function updateSel() {
+  const n = state.selected.size;
+  $('bookBtn').disabled = n === 0 || !state.token;
+  $('selInfo').textContent = !state.token
+    ? 'Sign in to book'
+    : n ? `${n} selected: ${[...state.selected].join(', ')}` : 'Pick a seat';
+}
+
+// --- booking ---------------------------------------------------------------
+async function book() {
+  if (!state.token) return say('Sign in first', true);
+  const seats = [...state.selected];
+  $('bookBtn').disabled = true;
+  try {
+    const d = await api('/bookings', {
+      method: 'POST', auth: true,
+      idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      body: { flight_id: Number(state.flight), seat_numbers: seats },
+    });
+    say(`Booked ${d.seats.join(', ')} — booking #${d.id}, ${rupees(d.total_price_cents)}`);
+    state.selected.clear();
+    await loadSeats();
+    await loadBookings();
+  } catch (e) {
+    // 409 here is the concurrency control working: someone took the seat
+    // between this page loading and the request arriving.
+    say(e.status === 409 ? `${e.message} — the seat map has been refreshed.` : e.message, true);
+    await loadSeats();
+  } finally { updateSel(); }
+}
+
+async function loadBookings() {
+  if (!state.token) return;
+  try {
+    const d = await api('/bookings', { auth: true });
+    if (!d.count) { $('bookings').innerHTML = '<div class="who">No bookings yet.</div>'; return; }
+    $('bookings').innerHTML = d.bookings.map((b) => {
+      const seats = b.seats.filter((s) => !s.cancelled_at).map((s) => s.seat.seat_number.trim());
+      const cancelled = b.status === 'cancelled';
+      return `<div class="bk">
+        <span class="id">#${b.id}</span>
+        <span class="who" style="flex:1">flight ${b.flight_id} · ${seats.length ? seats.join(', ') : '—'} · ${rupees(b.total_price_cents)}</span>
+        <span class="st ${cancelled ? 'cancelled' : ''}">${b.status}</span>
+        ${cancelled ? '' : `<button class="danger" data-cancel="${b.id}">Cancel</button>`}
+      </div>`;
+    }).join('');
+    document.querySelectorAll('[data-cancel]').forEach((el) =>
+      el.addEventListener('click', () => cancel(el.dataset.cancel)));
+  } catch (e) { say(e.message, true); }
+}
+
+async function cancel(id) {
+  try {
+    // No idempotency key: cancellation is idempotent by its own semantics, so
+    // clicking twice is harmless. See DECISIONS.md 017.
+    const d = await api(`/bookings/${id}/cancel`, { method: 'POST', auth: true });
+    say(`Booking #${id} cancelled — ${d.seats_released} seat(s) released`);
+    await loadBookings();
+    if (state.flight) await loadSeats();
+  } catch (e) { say(e.message, true); }
+}
+
+// --- wiring ----------------------------------------------------------------
+$('signupBtn').onclick = signup;
+$('loginBtn').onclick = login;
+$('logoutBtn').onclick = logout;
+$('searchBtn').onclick = search;
+$('bookBtn').onclick = book;
+
+(async function init() {
+  await loadAirports();
+  const t = sessionStorage.getItem('t'), e = sessionStorage.getItem('e');
+  if (t && e) setSession(t, e);
+  await search();
+})();
+</script>
+</body>
+</html>

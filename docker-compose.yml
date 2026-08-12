@@ -1,0 +1,460 @@
+# =============================================================================
+# Docker Compose — declares the infrastructure this project runs on.
+#
+# WHAT THIS FILE IS: a description of a set of containers and how they connect.
+# `docker compose up` reads it and makes reality match the description. Nothing
+# here is installed onto your Ubuntu — it all lives inside containers, and
+# `docker compose down -v` erases every trace.
+#
+# The full stack: PostgreSQL, Kafka, four application services, two background
+# workers, four one-shot migration jobs, and Nginx as the single public entry
+# point.
+#
+# ONLY NGINX PUBLISHES A PORT TO THE HOST (8080). The application services have
+# no host port mapping at all — they are reachable only on the internal Docker
+# network, by service name. That is what makes Nginx a gateway rather than a
+# convenience: there is no way to bypass it from outside.
+#
+# Postgres (5432) and Kafka (9092) do stay published, purely so psql, the
+# concurrency test and the host-mode dev workflow (./scripts/services.sh) keep
+# working. A production deployment would not publish either.
+# =============================================================================
+
+# YAML anchors — defined once, merged into each service with `<<: *name`.
+# Compose ignores top-level keys starting with `x-`.
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks: [airline]
+  environment: &db-env
+    DB_HOST: postgres
+    DB_PORT: 5432
+    # Inside the network, Kafka is reached on the INTERNAL listener by container
+    # name — NOT localhost:9092, which is the HOST listener and would resolve to
+    # the container itself. This is the advertised-listener trap the Kafka
+    # service comments describe, seen from the client side.
+    KAFKA_BROKERS: kafka:19092
+    KAFKA_TOPIC: booking-events
+    JWT_SECRET: dev_only_change_me_before_anything_real
+    TZ: UTC
+
+# Migration jobs are one-shot: they run, apply any pending migrations, and exit.
+# `restart: "no"` matters — the default would treat a successful exit as a crash
+# and run them forever.
+x-migrate-defaults: &migrate-defaults
+  restart: "no"
+  networks: [airline]
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — the database. Every service's data lives here.
+  # ---------------------------------------------------------------------------
+  postgres:
+    # A pre-built image from Docker Hub. "17" is the major version; "-alpine"
+    # means it is built on Alpine Linux, a minimal distro (~80 MB vs ~380 MB).
+    #
+    # The tag is pinned to 17 rather than left as `latest`. `latest` means your
+    # laptop and a colleague's machine can silently run different major versions
+    # of Postgres, which is exactly the "works on my machine" class of bug that
+    # containers are supposed to eliminate. Always pin.
+    image: postgres:17-alpine
+
+    container_name: airline-postgres
+
+    # If the container crashes, restart it — but not if you deliberately stopped it.
+    restart: unless-stopped
+
+    networks: [airline]
+
+    environment:
+      # These configure the *superuser* account created on first boot. The
+      # per-service accounts with restricted permissions are created by the init
+      # script in db/init/.
+      #
+      # Local-development credentials only. They are committed on purpose so the
+      # whole stack comes up with one command. Real deployments inject secrets at
+      # runtime and never place them in a file that reaches version control.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+
+      # Sets the timezone-agnostic default. All our timestamp columns are
+      # TIMESTAMPTZ, which stores absolute instants, so the server's local
+      # timezone should never matter — but pinning it to UTC removes any doubt.
+      TZ: UTC
+
+    ports:
+      # "HOST:CONTAINER" — port 5432 inside the container is published to port
+      # 5432 on your machine, so tools running directly in Ubuntu (and the Node
+      # services, during development) can connect to localhost:5432.
+      #
+      # Without this line the database would still run and still be reachable by
+      # other containers, but nothing outside Docker could reach it.
+      - "5432:5432"
+
+    volumes:
+      # A named volume: storage that outlives the container. Without this, every
+      # `docker compose down` would wipe your database, because a container's own
+      # filesystem is discarded when it is removed.
+      - pgdata:/var/lib/postgresql/data
+
+      # A bind mount of a local folder into the container, read-only (:ro).
+      # The Postgres image runs every .sql and .sh file it finds in this
+      # directory, in alphabetical order, but ONLY on first initialisation —
+      # i.e. only when the pgdata volume is empty. Re-running these scripts later
+      # requires `docker compose down -v` to delete the volume first.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+
+    healthcheck:
+      # Docker runs this command periodically to decide whether the container is
+      # merely *running* or actually *ready to serve*. The distinction matters:
+      # Postgres takes a few seconds to accept connections after the process
+      # starts, and services that connect too early crash on startup.
+      #
+      # Later, application services will declare `depends_on: postgres:
+      # condition: service_healthy` so Compose holds them back until this passes.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Kafka — the event log that carries booking events to other services.
+  #
+  # Running in KRaft mode: Kafka manages its own cluster metadata using an
+  # internal Raft quorum. Older Kafka required a separate ZooKeeper cluster for
+  # this, which meant a second distributed system to run, monitor and reason
+  # about. KRaft removed that dependency (production-ready since Kafka 3.3), so
+  # a ZooKeeper container here would be pure legacy weight.
+  #
+  # One broker, replication factor 1. A real cluster runs at least three so a
+  # broker can die without data loss — stated plainly because a single broker is
+  # a single point of failure and no amount of configuration hides that.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: airline-kafka
+    restart: unless-stopped
+
+    networks: [airline]
+
+    environment:
+      # This node is both a broker (serves produce/consume) and a controller
+      # (participates in the metadata quorum). Split roles across separate nodes
+      # in production; combined is normal for a single-node dev setup.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # THREE listeners, because clients reach this broker by two different
+      # names depending on where they run:
+      #   INTERNAL   — other containers, which resolve the hostname `kafka`
+      #   HOST       — the Node services during development, running directly on
+      #                Ubuntu, which reach it as localhost:9092
+      #   CONTROLLER — the internal Raft quorum, never touched by clients
+      #
+      # ADVERTISED_LISTENERS is the subtle part: on connect, a broker tells the
+      # client which address to use for subsequent requests. Advertise the wrong
+      # name and the first connection succeeds while every later one fails —
+      # the classic Kafka-in-Docker trap.
+      KAFKA_LISTENERS: CONTROLLER://:9093,INTERNAL://:19092,HOST://:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,HOST:PLAINTEXT
+
+      # Single broker, so nothing can be replicated anywhere else.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Don't wait for other consumers to join before starting to rebalance —
+      # the default 3s delay just slows development down.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+      # MUST be set explicitly, and MUST match the volume mount below.
+      #
+      # This image defaults to /tmp/kafka-logs. A named volume mounted anywhere
+      # else is silently useless — Docker creates it, mounts it, and Kafka never
+      # writes a byte to it, so every topic and message is destroyed the moment
+      # the container is recreated. It fails quietly: the volume exists, the
+      # container is healthy, and the data is simply gone.
+      #
+      # /tmp is also the wrong place for data that is supposed to survive.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+      CLUSTER_ID: airline-booking-kraft-cluster
+      TZ: UTC
+
+    ports:
+      - "9092:9092"
+
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+
+    healthcheck:
+      # Asking the broker to list topics proves it is actually serving, not just
+      # running. Services depending on Kafka wait for this to pass.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # ===========================================================================
+  # KAFKA TOPIC CREATION — one-shot, like the migration jobs.
+  #
+  # Broker-side auto-topic-creation is deliberately off (a typo in a topic name
+  # should fail loudly, not silently create a topic nothing consumes), so topics
+  # must be declared. Doing it here rather than in a script the operator has to
+  # remember means `docker compose up -d` alone brings up a working stack — a
+  # fresh clone otherwise starts with both consumers crash-looping on
+  # UNKNOWN_TOPIC_OR_PARTITION.
+  #
+  # --if-not-exists makes it idempotent, so a restart is harmless.
+  # ===========================================================================
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: airline-kafka-init
+    restart: "no"
+    networks: [airline]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      /opt/kafka/bin/kafka-topics.sh
+        --bootstrap-server kafka:19092
+        --create --if-not-exists
+        --topic booking-events
+        --partitions 3
+        --replication-factor 1
+
+  # ===========================================================================
+  # MIGRATION JOBS — run once, apply pending migrations, exit.
+  #
+  # Built from the `migrator` stage of each service's Dockerfile, which keeps
+  # devDependencies because sequelize-cli lives there. The application images
+  # are built from the `runtime` stage and do not contain it.
+  #
+  # Each app service waits on its migrator with
+  # `condition: service_completed_successfully`, so no service ever starts
+  # against a schema that has not been brought up to date.
+  # ===========================================================================
+  auth-migrate:
+    <<: *migrate-defaults
+    build: { context: ./services/auth, target: migrator }
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: auth_db
+      DB_USER: auth_svc
+      DB_PASSWORD: auth_dev_pw
+
+  flights-migrate:
+    <<: *migrate-defaults
+    build: { context: ./services/flights, target: migrator }
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: flights_db
+      DB_USER: flights_svc
+      DB_PASSWORD: flights_dev_pw
+
+  bookings-migrate:
+    <<: *migrate-defaults
+    build: { context: ./services/bookings, target: migrator }
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: bookings_db
+      DB_USER: bookings_svc
+      DB_PASSWORD: bookings_dev_pw
+
+  notifications-migrate:
+    <<: *migrate-defaults
+    build: { context: ./services/notifications, target: migrator }
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: notifications_db
+      DB_USER: notifications_svc
+      DB_PASSWORD: notifications_dev_pw
+
+  # ===========================================================================
+  # APPLICATION SERVICES — no host ports. Reachable only through Nginx.
+  # ===========================================================================
+  auth:
+    <<: *service-defaults
+    build: { context: ./services/auth, target: runtime }
+    container_name: airline-auth
+    environment:
+      <<: *db-env
+      PORT: 4001
+      DB_NAME: auth_db
+      DB_USER: auth_svc
+      DB_PASSWORD: auth_dev_pw
+      JWT_EXPIRES_IN: 1h
+    depends_on:
+      postgres: { condition: service_healthy }
+      auth-migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  flights:
+    <<: *service-defaults
+    build: { context: ./services/flights, target: runtime }
+    container_name: airline-flights
+    environment:
+      <<: *db-env
+      PORT: 4002
+      DB_NAME: flights_db
+      DB_USER: flights_svc
+      DB_PASSWORD: flights_dev_pw
+    depends_on:
+      postgres: { condition: service_healthy }
+      flights-migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4002/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  bookings:
+    <<: *service-defaults
+    build: { context: ./services/bookings, target: runtime }
+    container_name: airline-bookings
+    environment:
+      <<: *db-env
+      PORT: 4003
+      DB_NAME: bookings_db
+      DB_USER: bookings_svc
+      DB_PASSWORD: bookings_dev_pw
+      FLIGHTS_SERVICE_URL: http://flights:4002
+      # The racy demo endpoint stays OFF in the containerised stack. Nginx also
+      # refuses to route /demo/ — two independent controls, because a single
+      # misconfiguration should not expose it.
+      ENABLE_UNSAFE_DEMO: "false"
+    depends_on:
+      postgres: { condition: service_healthy }
+      bookings-migrate: { condition: service_completed_successfully }
+      flights: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4003/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ===========================================================================
+  # BACKGROUND WORKERS — same images as the services above, different commands.
+  #
+  # Separate containers rather than threads inside the API processes, because
+  # they scale and fail independently: the relay can be restarted without
+  # dropping in-flight HTTP requests, and a consumer crash does not take the
+  # booking API down with it.
+  # ===========================================================================
+  relay:
+    <<: *service-defaults
+    build: { context: ./services/bookings, target: runtime }
+    container_name: airline-relay
+    command: ["node", "src/relay.js"]
+    environment:
+      <<: *db-env
+      DB_NAME: bookings_db
+      DB_USER: bookings_svc
+      DB_PASSWORD: bookings_dev_pw
+      RELAY_POLL_INTERVAL_MS: 1000
+      RELAY_BATCH_SIZE: 100
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      bookings-migrate: { condition: service_completed_successfully }
+
+  flights-consumer:
+    <<: *service-defaults
+    build: { context: ./services/flights, target: runtime }
+    container_name: airline-flights-consumer
+    command: ["node", "src/consumer.js"]
+    environment:
+      <<: *db-env
+      DB_NAME: flights_db
+      DB_USER: flights_svc
+      DB_PASSWORD: flights_dev_pw
+      KAFKA_CONSUMER_GROUP: flights-read-model
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      flights-migrate: { condition: service_completed_successfully }
+
+  notifications:
+    <<: *service-defaults
+    build: { context: ./services/notifications, target: runtime }
+    container_name: airline-notifications
+    environment:
+      <<: *db-env
+      DB_NAME: notifications_db
+      DB_USER: notifications_svc
+      DB_PASSWORD: notifications_dev_pw
+      KAFKA_CONSUMER_GROUP: notifications
+      NOTIFICATION_OUTPUT: /var/log/airline/notifications-sent.log
+    volumes:
+      # Bind-mounted so the simulated notification output is readable from the
+      # host, the same file the host-mode workflow writes to.
+      - ./.logs:/var/log/airline
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      notifications-migrate: { condition: service_completed_successfully }
+
+  # ===========================================================================
+  # NGINX — the API gateway. The only thing the outside world can reach.
+  # ===========================================================================
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: airline-nginx
+    restart: unless-stopped
+    networks: [airline]
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/proxy_common.conf:/etc/nginx/proxy_common.conf:ro
+      # The web client. Static files, served by the gateway itself — no separate
+      # frontend container, and no cross-origin requests from the browser.
+      - ./web:/usr/share/nginx/html:ro
+    depends_on:
+      auth: { condition: service_healthy }
+      flights: { condition: service_healthy }
+      bookings: { condition: service_healthy }
+    healthcheck:
+      # 127.0.0.1, not `localhost`. Inside the container `localhost` can resolve
+      # to ::1 first, and this nginx listens only on IPv4 — so the healthcheck
+      # would report the gateway as down while it happily served real traffic.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# An explicit network so containers resolve each other by service name through
+# Docker's embedded DNS. Compose would create one implicitly; naming it makes
+# the dependency visible rather than magic.
+networks:
+  airline:
+    driver: bridge
+
+# Declares the named volumes referenced above. Docker manages where these
+# actually live on disk; you refer to them only by name.
+volumes:
+  pgdata:
+  kafkadata:

@@ -1,0 +1,13 @@
+# Never copy the host's node_modules into the image. It may contain native
+# binaries compiled for the host's OS/libc, which will not run in the container.
+# Dependencies are installed inside the image by `npm ci` instead.
+node_modules
+
+# Real credentials never enter an image. Configuration is injected at runtime
+# via docker-compose `environment:`, which is also why dotenv finding no .env
+# file inside the container is correct rather than a bug.
+.env
+
+npm-debug.log*
+.git
+.logs

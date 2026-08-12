@@ -1,0 +1,20 @@
+# Dependencies — never committed. These are downloaded from package.json,
+# which IS committed. Tens of thousands of files, reproducible from a lockfile.
+node_modules/
+
+# Secrets. .env holds real credentials; .env.example holds the shape of them
+# with dummy values and IS committed, so a new developer knows what to fill in.
+.env
+!.env.example
+
+# Runtime output
+*.log
+npm-debug.log*
+coverage/
+dist/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+.logs/
